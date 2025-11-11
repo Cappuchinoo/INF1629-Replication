@@ -1,0 +1,22 @@
+SELECT COUNT(*) FROM table_3;
+
+SELECT COUNT(*) 
+FROM table_3
+WHERE column_22 >= DATE '2019-01-01'
+  AND column_22 < DATE '2021-01-01';
+
+SELECT column_1, COUNT(*)
+FROM table_3
+GROUP BY column_1
+ORDER BY COUNT(*) DESC
+LIMIT 20;
+
+SELECT 
+    MIN(column_6),
+    MAX(column_6),
+    AVG(column_6)
+FROM table_3;
+
+SELECT COUNT(*)
+FROM table_3
+WHERE column_6 > 0;
