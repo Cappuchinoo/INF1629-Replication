@@ -16,7 +16,7 @@ WHERE c.email IS NOT NULL    -- substitui o filtro impossível
 ORDER BY
     (SELECT SUM(o2.total::numeric)
      FROM "order" o2
-     WHERE o2.customer = c.id) DESC;
+     WHERE o2.customer = c.id) DESC
 
 SELECT DISTINCT
     a.id AS article_id,
@@ -32,7 +32,7 @@ JOIN order_positions op ON op.articleid = a.id
 JOIN "order" o ON o.id = op.orderid
 WHERE o.ordertimestamp >= (SELECT MIN(ordertimestamp) FROM "order")
   AND p.name IS NOT NULL       -- substitui o filtro impossível
-ORDER BY rnd;
+ORDER BY rnd
 
 SELECT
     c.id,
@@ -45,7 +45,7 @@ WHERE c.id IN (
     FROM "order" o
     JOIN order_positions op ON op.orderid = o.id
     WHERE op.amount >= 1
-);
+)
 
 SELECT DISTINCT
     c.id,
@@ -56,7 +56,7 @@ SELECT DISTINCT
 FROM customer c
 LEFT JOIN "order" o ON o.customer = c.id
 WHERE o.ordertimestamp >= (SELECT MIN(ordertimestamp) FROM "order")
-ORDER BY o.ordertimestamp DESC;
+ORDER BY o.ordertimestamp DESC
 
 SELECT
     c.id,
@@ -69,7 +69,7 @@ SELECT
     ) AS total_spent
 FROM customer c
 WHERE c.id IN (SELECT customer FROM "order")
-ORDER BY total_spent DESC NULLS LAST;
+ORDER BY total_spent DESC NULLS LAST
 
 SELECT
     p.id AS product_id,
@@ -83,7 +83,7 @@ WHERE o.ordertimestamp >= (SELECT MIN(ordertimestamp) FROM "order")
   AND p.currentlyactive = TRUE
 GROUP BY p.id, p.name
 ORDER BY revenue_period DESC
-LIMIT 10;
+LIMIT 10
 
 SELECT
     c.id,
@@ -95,7 +95,7 @@ JOIN "order" o ON o.customer = c.id
 GROUP BY c.id, c.firstname, c.lastname
 HAVING COUNT(o.id) >= 5
 ORDER BY num_orders DESC
-LIMIT 50;
+LIMIT 50
 
 SELECT
     o.id AS order_id,
@@ -109,7 +109,7 @@ FROM "order" o
 JOIN customer c ON c.id = o.customer
 WHERE o.ordertimestamp >= (SELECT MIN(ordertimestamp) FROM "order")
 ORDER BY o.ordertimestamp DESC
-LIMIT 500;
+LIMIT 500
 
 SELECT
     p.category,
@@ -122,7 +122,7 @@ JOIN order_positions op ON op.articleid = a.id
 JOIN "order" o ON o.id = op.orderid
 WHERE o.ordertimestamp >= (SELECT MIN(ordertimestamp) FROM "order")
 GROUP BY p.category, p.id, p.name
-ORDER BY p.category, total_qty DESC;
+ORDER BY p.category, total_qty DESC
 
 SELECT
     c.id,
@@ -135,4 +135,4 @@ GROUP BY c.id, c.firstname, c.lastname
 HAVING MAX(o.ordertimestamp) < current_date - interval '6 months'
     OR MAX(o.ordertimestamp) IS NULL
 ORDER BY last_order_timestamp NULLS FIRST
-LIMIT 200;
+LIMIT 200
