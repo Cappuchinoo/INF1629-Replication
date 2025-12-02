@@ -1,0 +1,10 @@
+order_positions
+stock
+products
+order
+articles
+address
+sizes
+labels
+colors
+customer
