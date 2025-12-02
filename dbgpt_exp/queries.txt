@@ -1,22 +1,138 @@
-SELECT COUNT(*) FROM table_3;
+SELECT
+    c.id AS customer_id,
+    (SELECT c2.firstname || ' ' || c2.lastname
+     FROM customer c2
+     WHERE c2.id = c.id) AS full_name,
+    (
+      SELECT SUM(o.total::numeric)
+      FROM "order" o
+      WHERE o.customer = c.id
+        AND date_trunc('year', o.ordertimestamp) = (
+            SELECT date_trunc('year', MIN(ordertimestamp)) FROM "order"
+        )
+    ) AS total_spent_last_year
+FROM customer c
+WHERE c.email IS NOT NULL    -- substitui o filtro impossível
+ORDER BY
+    (SELECT SUM(o2.total::numeric)
+     FROM "order" o2
+     WHERE o2.customer = c.id) DESC;
 
-SELECT COUNT(*) 
-FROM table_3
-WHERE column_22 >= DATE '2019-01-01'
-  AND column_22 < DATE '2021-01-01';
+SELECT DISTINCT
+    a.id AS article_id,
+    p.name AS product_name,
+    a.originalprice,
+    a.reducedprice,
+    c.name AS color_name,
+    random() AS rnd
+FROM articles a
+JOIN products p ON p.id = a.productid
+JOIN colors c ON c.id = a.colorid
+JOIN order_positions op ON op.articleid = a.id
+JOIN "order" o ON o.id = op.orderid
+WHERE o.ordertimestamp >= (SELECT MIN(ordertimestamp) FROM "order")
+  AND p.name IS NOT NULL       -- substitui o filtro impossível
+ORDER BY rnd;
 
-SELECT column_1, COUNT(*)
-FROM table_3
-GROUP BY column_1
-ORDER BY COUNT(*) DESC
-LIMIT 20;
+SELECT
+    c.id,
+    c.firstname,
+    c.lastname,
+    c.email
+FROM customer c
+WHERE c.id IN (
+    SELECT DISTINCT o.customer
+    FROM "order" o
+    JOIN order_positions op ON op.orderid = o.id
+    WHERE op.amount >= 1
+);
 
-SELECT 
-    MIN(column_6),
-    MAX(column_6),
-    AVG(column_6)
-FROM table_3;
+SELECT DISTINCT
+    c.id,
+    c.firstname,
+    c.lastname,
+    o.id AS order_id,
+    o.ordertimestamp
+FROM customer c
+LEFT JOIN "order" o ON o.customer = c.id
+WHERE o.ordertimestamp >= (SELECT MIN(ordertimestamp) FROM "order")
+ORDER BY o.ordertimestamp DESC;
 
-SELECT COUNT(*)
-FROM table_3
-WHERE column_6 > 0;
+SELECT
+    c.id,
+    c.firstname,
+    c.lastname,
+    (
+        SELECT SUM(o.total::numeric)
+        FROM "order" o
+        WHERE o.customer = c.id
+    ) AS total_spent
+FROM customer c
+WHERE c.id IN (SELECT customer FROM "order")
+ORDER BY total_spent DESC NULLS LAST;
+
+SELECT
+    p.id AS product_id,
+    p.name AS product_name,
+    SUM(op.amount * op.price::numeric) AS revenue_period
+FROM products p
+JOIN articles a ON a.productid = p.id
+JOIN order_positions op ON op.articleid = a.id
+JOIN "order" o ON o.id = op.orderid
+WHERE o.ordertimestamp >= (SELECT MIN(ordertimestamp) FROM "order")
+  AND p.currentlyactive = TRUE
+GROUP BY p.id, p.name
+ORDER BY revenue_period DESC
+LIMIT 10;
+
+SELECT
+    c.id,
+    c.firstname,
+    c.lastname,
+    COUNT(o.id) AS num_orders
+FROM customer c
+JOIN "order" o ON o.customer = c.id
+GROUP BY c.id, c.firstname, c.lastname
+HAVING COUNT(o.id) >= 5
+ORDER BY num_orders DESC
+LIMIT 50;
+
+SELECT
+    o.id AS order_id,
+    o.ordertimestamp,
+    c.id AS customer_id,
+    c.firstname,
+    c.lastname,
+    o.total,
+    o.shippingcost
+FROM "order" o
+JOIN customer c ON c.id = o.customer
+WHERE o.ordertimestamp >= (SELECT MIN(ordertimestamp) FROM "order")
+ORDER BY o.ordertimestamp DESC
+LIMIT 500;
+
+SELECT
+    p.category,
+    p.id AS product_id,
+    p.name AS product_name,
+    SUM(op.amount) AS total_qty
+FROM products p
+JOIN articles a ON a.productid = p.id
+JOIN order_positions op ON op.articleid = a.id
+JOIN "order" o ON o.id = op.orderid
+WHERE o.ordertimestamp >= (SELECT MIN(ordertimestamp) FROM "order")
+GROUP BY p.category, p.id, p.name
+ORDER BY p.category, total_qty DESC;
+
+SELECT
+    c.id,
+    c.firstname,
+    c.lastname,
+    MAX(o.ordertimestamp) AS last_order_timestamp
+FROM customer c
+LEFT JOIN "order" o ON o.customer = c.id
+GROUP BY c.id, c.firstname, c.lastname
+HAVING MAX(o.ordertimestamp) < current_date - interval '6 months'
+    OR MAX(o.ordertimestamp) IS NULL
+ORDER BY last_order_timestamp NULLS FIRST
+LIMIT 200;

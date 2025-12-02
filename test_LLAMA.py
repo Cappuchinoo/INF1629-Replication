@@ -7,11 +7,22 @@ import psycopg2
 import ollama  
 
 # ====== CONFIGURAÇÕES ======
-PG_HOST = "localhost"
-PG_PORT = '5432'          
-PG_DB = "shopmall"        # troque para "goods" quando quiser
-PG_USER = "postgres"
-PG_PASS = "postgres"
+PG_URL = "postgresql://neondb_owner:npg_xAOBhf4MkK5C@ep-plain-sunset-aervpg8i-pooler.c-2.us-east-2.aws.neon.tech/webshopdb?sslmode=require&channel_binding=require"
+
+SCHEMA_HINT = """
+webshop.address(id, customerid, firstname, lastname, address1, address2, city, zip, created, updated)
+webshop.articles(id, productid, ean, colorid, size, description, originalprice, reducedprice, taxrate, discountinpercent, currentlyactive, created, updated)
+webshop.colors(id, name, rgb)
+webshop.customer(id, firstname, lastname, gender, email, dateofbirth, currentaddressid, created, updated)
+webshop.labels(id, name, slugname, icon)
+webshop.order(id, customer, ordertimestamp, shippingaddressid, total, shippingcost, created, updated)
+webshop.order_positions(id, orderid, articleid, amount, price, created, updated)
+webshop.products(id, name, labelid, category, gender, currentlyactive, created, updated)
+webshop.sizes(id, gender, category, size, size_us, size_uk, size_eu)
+webshop.stock(id, articleid, count, created, updated)
+""".strip()
+
+PROMPT_TECHNIQUE = "zero-shot"  # ou "few-shot" ou "chain-of-thought"
 
 QUERIES_FILE = "dbgpt_exp/queries.txt"
 RESULTS_CSV = "dbgpt_exp/results_ollama.csv"
@@ -36,9 +47,7 @@ on (t1.a = avg and t1.b = t3.b);
 
 # ====== CONEXÃO PG ======
 def pg_conn():
-    return psycopg2.connect(
-        host=PG_HOST, port=PG_PORT, dbname=PG_DB, user=PG_USER, password=PG_PASS
-    )
+    return psycopg2.connect(PG_URL)
 
 def fetch_all(sql: str):
     with pg_conn() as conn, conn.cursor() as cur:
@@ -71,26 +80,47 @@ def rows_signature(rows):
         h.update(json.dumps(r, default=str).encode("utf-8"))
     return h.hexdigest()
 
+def build_zero_shot_prompt(original_sql, schema_hint=""):
+    prompt = (
+        f"{PROMPT_INSTRUCTION}\n"
+        f"{'Schema: ' + schema_hint if schema_hint else ''}\n"
+        f"Input SQL:\n{original_sql}\n"
+        f"Output SQL:"
+    )
+    return prompt
+
+def build_few_shot_prompt(original_sql, schema_hint=""):
+    prompt = (
+        f"{PROMPT_INSTRUCTION}\n"
+        f"{PROMPT_EXAMPLE}\n"
+        f"{'Schema: ' + schema_hint if schema_hint else ''}\n"
+        f"Input SQL:\n{original_sql}\n"
+        f"Output SQL:"
+    )
+    return prompt
+
+def build_chain_of_thought_prompt(original_sql, schema_hint=""):
+    prompt = (
+        f"{PROMPT_INSTRUCTION}\n"
+        f"{'Schema: ' + schema_hint if schema_hint else ''}\n"
+        f"Input SQL:\n{original_sql}\n"
+        "First, explain step by step how you would optimize this query for lower latency in PostgreSQL. "
+        "Then, provide ONLY the final optimized SQL query."
+    )
+    return prompt
+
 # ====== OLLAMA ======
 def rewrite_sql_via_ollama(original_sql: str, schema_hint: str = "") -> str:
-    # Crie o prompt no mesmo formato
-    parts = [
-        PROMPT_INSTRUCTION,
-        "",
-        PROMPT_EXAMPLE,
-        ""
-    ]
-    if schema_hint:
-        parts.append("Schema:")
-        parts.append(schema_hint)
-        parts.append("")  # linha em branco
+    if PROMPT_TECHNIQUE == "zero-shot":
+        user_content = build_zero_shot_prompt(original_sql, schema_hint)
+    elif PROMPT_TECHNIQUE == "few-shot":
+        user_content = build_few_shot_prompt(original_sql, schema_hint)
+    elif PROMPT_TECHNIQUE == "chain-of-thought":
+        user_content = build_chain_of_thought_prompt(original_sql, schema_hint)
+    else:
+        raise ValueError("Técnica de prompt desconhecida.")
 
-    parts.append("Input:")
-    parts.append(original_sql.strip())
-
-    user_content = "\n".join(parts)
-
-    # Gere a resposta usando o Ollama
+    # (restante da função igual)
     retry_count = 0
     while retry_count < 5:
         try:
@@ -106,6 +136,13 @@ def rewrite_sql_via_ollama(original_sql: str, schema_hint: str = "") -> str:
             # Remover o prefixo "sql" se estiver presente
             if rewritten_sql.lower().startswith("sql "):
                 rewritten_sql = rewritten_sql[3:].strip()
+
+            # Se for chain-of-thought, preciso extrair só o SQL da resposta
+            if PROMPT_TECHNIQUE == "chain-of-thought":
+                # Extrai a última linha que começa com SELECT ou outro comando SQL
+                lines = [l for l in rewritten_sql.splitlines() if l.strip().upper().startswith(("SELECT", "WITH", "INSERT", "UPDATE", "DELETE"))]
+                if lines:
+                    rewritten_sql = "\n".join(lines)
             return rewritten_sql
         except Exception as e:
             print(f"Erro ao chamar Ollama: {e}. Tentando novamente...")
@@ -174,7 +211,7 @@ def main():
             speedup = (t_orig / t_rew) if (isinstance(t_orig, float) and isinstance(t_rew, float) and t_rew > 0) else ""
 
             w.writerow([
-                PG_DB, i,
+                "webshopdb", i,
                 f"{t_orig:.3f}" if isinstance(t_orig, float) else "",
                 f"{exec_ms_o:.3f}" if exec_ms_o else "",
                 f"{plan_ms_o:.3f}" if plan_ms_o else "",
