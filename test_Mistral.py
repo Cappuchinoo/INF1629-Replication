@@ -89,6 +89,11 @@ def fetch_all(sql: str):
 
 
 def run_timed(sql: str):
+    # LOG: toda SQL enviada pro Neon (para fetch_all)
+    print("\n[NEON][RUN_TIMED] Executando SQL no Neon:")
+    print(sql)
+    print("[NEON][RUN_TIMED] Fim da SQL\n")
+
     t0 = time.time()
     rows = fetch_all(sql)
     dt = (time.time() - t0) * 1000.0  # ms
@@ -96,6 +101,11 @@ def run_timed(sql: str):
 
 
 def explain_json(sql: str):
+    # LOG: toda SQL enviada pro Neon (para EXPLAIN)
+    print("\n[NEON][EXPLAIN] Executando EXPLAIN no Neon para a SQL:")
+    print(sql)
+    print("[NEON][EXPLAIN] Fim da SQL\n")
+
     with pg_conn() as conn, conn.cursor() as cur:
         cur.execute("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + sql)
         data = cur.fetchall()[0][0][0]  # JSON root obj (list with one element)
@@ -181,10 +191,15 @@ def extract_sql(text: str) -> str:
     return text.strip()
 
 
-# ====== LLM MISTRAL – AGORA COM LIMPEZA ======
+# ====== LLM MISTRAL – AGORA COM LIMPEZA E LOG COMPLETO ======
 
 
 def rewrite_sql_via_mistral(original_sql: str, schema_hint: str = "") -> str:
+    # LOG: SQL original que está indo para a LLM
+    print("\n[LLM][INPUT] SQL original que será otimizada:")
+    print(original_sql)
+    print("[LLM][INPUT] Fim da SQL original\n")
+
     if PROMPT_TECHNIQUE == "zero-shot":
         user_content = build_zero_shot_prompt(original_sql, schema_hint)
     elif PROMPT_TECHNIQUE == "few-shot":
@@ -193,6 +208,11 @@ def rewrite_sql_via_mistral(original_sql: str, schema_hint: str = "") -> str:
         user_content = build_chain_of_thought_prompt(original_sql, schema_hint)
     else:
         raise ValueError("Técnica de prompt desconhecida.")
+
+    # LOG: prompt completo enviado para a LLM
+    print("=============== PROMPT ENVIADO PARA A LLM ===============")
+    print(user_content)
+    print("============= FIM PROMPT ENVIADO PARA A LLM =============\n")
 
     retry_count = 0
     while retry_count < 5:
@@ -214,12 +234,19 @@ def rewrite_sql_via_mistral(original_sql: str, schema_hint: str = "") -> str:
             # 🧹 Extrai apenas a SQL da resposta
             cleaned = extract_sql(raw)
 
-            print("===== SQL EXTRAÍDA DO MISTRAL =====")
+            print("===== SQL EXTRAÍDA DO MISTRAL (LIMPA) =====")
             print(cleaned)
-            print("=========== FIM SQL EXTRAÍDA ======\n")
+            print("=========== FIM SQL EXTRAÍDA (LIMPA) ======\n")
 
             # fallback: se por algum motivo vier vazio, usa o raw mesmo
-            return cleaned if cleaned else raw.strip()
+            final_sql = cleaned if cleaned else raw.strip()
+
+            # LOG: SQL final que será enviada para o Neon
+            print("[LLM][OUTPUT→NEON] SQL reescrita que será executada no Neon:")
+            print(final_sql)
+            print("[LLM][OUTPUT→NEON] Fim da SQL reescrita\n")
+
+            return final_sql
 
         except Exception as e:
             print(f"Erro ao chamar Mistral: {e}. Tentando novamente...")
@@ -272,13 +299,22 @@ def main():
             ])
 
         for i, original in enumerate(queries, start=1):
-            print(f"\n=== Query {i} ({PROMPT_TECHNIQUE}, {MISTRAL_MODEL}) ===")
+            print(f"\n===================================================")
+            print(f"=== Query {i} ({PROMPT_TECHNIQUE}, {MISTRAL_MODEL}) ===")
+            print("===================================================\n")
 
-            # LLM rewrite usando Mistral (AGORA COM LIMPEZA)
+            # LOG: SQL original lida do arquivo
+            print("[PIPELINE] SQL original lida do arquivo (antes da LLM):")
+            print(original)
+            print("[PIPELINE] Fim SQL original lida do arquivo\n")
+
+            # LLM rewrite usando Mistral (AGORA COM LIMPEZA + LOG)
             rewritten = rewrite_sql_via_mistral(original)
 
             # Original
             try:
+                print(
+                    "[PIPELINE][ORIGINAL→NEON] Executando versão ORIGINAL no Neon...\n")
                 rows_orig, t_orig = run_timed(original)
                 ej_orig, plan_ms_o, exec_ms_o, plan_o = explain_json(original)
             except Exception as e:
@@ -288,6 +324,8 @@ def main():
 
             # Rewritten
             try:
+                print(
+                    "[PIPELINE][REWRITTEN→NEON] Executando versão REESCRITA no Neon...\n")
                 rows_rew, t_rew = run_timed(rewritten)
                 ej_rew, plan_ms_r, exec_ms_r, plan_r = explain_json(rewritten)
             except Exception as e:
@@ -333,6 +371,7 @@ def main():
             ])
 
             print("OK → linha gravada em", RESULTS_CSV)
+            print("===================================================\n")
 
 
 if __name__ == "__main__":
