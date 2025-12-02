@@ -2,14 +2,16 @@ import os, time, csv, json, hashlib
 from openai import OpenAI
 import psycopg2
 
+PROMPT_MODE = "cot"
+
 # ====== CONFIGURAÇÕES ======
 PG_HOST = "localhost"
 PG_PORT = 6543            # confirme com `docker ps`
-PG_DB   = "shopmall"      # troque para "goods" quando quiser
+PG_DB   = "sampledb"
 PG_USER = "postgres"
 PG_PASS = "postgres"
 
-OPENAI_MODEL = "gpt-5"    # ou "gpt-4.1" / "gpt-4o" etc.
+OPENAI_MODEL = "gpt-4o"    # ou "gpt-4.1" / "gpt-4o" etc.
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 QUERIES_FILE = "dbgpt_exp/queries.txt"
@@ -30,6 +32,42 @@ select ... from t1 inner join (
 ) as t3
 on (t1.a = avg and t1.b = t3.b);
 """
+
+# ====== CONSTRUÇÃO DE PROMPTS (Zero-shot / Few-shot / Prompt-Chaining) ======
+
+def build_zero_shot_prompt(original_sql: str, schema_hint: str = "") -> str:
+    schema_line = f"Schema: {schema_hint}\n" if schema_hint else ""
+    prompt = (
+        f"{PROMPT_INSTRUCTION}\n"
+        f"{schema_line}"
+        f"Input SQL:\n{original_sql.strip()}\n"
+        f"Output SQL:"
+    )
+    return prompt
+
+
+def build_few_shot_prompt(original_sql: str, schema_hint: str = "") -> str:
+    schema_line = f"Schema: {schema_hint}\n" if schema_hint else ""
+    prompt = (
+        f"{PROMPT_INSTRUCTION}\n"
+        f"{PROMPT_EXAMPLE}\n"
+        f"{schema_line}"
+        f"Input SQL:\n{original_sql.strip()}\n"
+        f"Output SQL:"
+    )
+    return prompt
+
+
+def build_chain_of_thought_prompt(original_sql: str, schema_hint: str = "") -> str:
+    schema_line = f"Schema: {schema_hint}\n" if schema_hint else ""
+    prompt = (
+        f"{PROMPT_INSTRUCTION}\n"
+        f"{schema_line}"
+        f"Input SQL:\n{original_sql.strip()}\n"
+        "First, explain step by step how you would optimize this query for lower latency in PostgreSQL. "
+        "Then, provide ONLY the final optimized SQL query."
+    )
+    return prompt
 
 # ====== CONEXÃO PG ======
 def pg_conn():
@@ -53,49 +91,88 @@ def run_timed(sql: str):
 def explain_json(sql: str):
     with pg_conn() as conn, conn.cursor() as cur:
         cur.execute("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + sql)
-        data = cur.fetchall()[0][0][0]  # JSON root obj (list with one element)
-        # Times em ms, se disponíveis
+        data = cur.fetchall()[0][0][0]
         planning = data.get("Planning Time", None)
         execution = data.get("Execution Time", None)
         plan = data.get("Plan", {})
         return data, planning, execution, plan
 
 def rows_signature(rows):
-    # assinatura simples para checar equivalência de resultado
-    # (ordem pode variar; se necessário, ajuste sua query para ORDER BY)
     h = hashlib.md5()
     for r in rows:
         h.update(json.dumps(r, default=str).encode("utf-8"))
     return h.hexdigest()
 
+def extract_sql_from_response(raw: str) -> str:
+    cleaned = raw.strip()
+
+    # Tenta encontrar bloco ```sql ... ```
+    lower = cleaned.lower()
+    if "```sql" in lower:
+        idx = lower.index("```sql")
+        segment = cleaned[idx + len("```sql"):]
+        # corta no próximo ```
+        if "```" in segment:
+            segment = segment.split("```", 1)[0]
+        return segment.strip()
+
+    # Pega a última linha que começa com SELECT
+    lines = cleaned.splitlines()
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].lstrip().upper().startswith("SELECT"):
+            return "\n".join(lines[i:]).strip()
+
+    # 3) Fallback: retornar tudo
+    return cleaned.strip()
+
 # ====== OPENAI ======
-def rewrite_sql_via_llm(original_sql: str, schema_hint: str = "") -> str:
+def rewrite_sql_via_llm(
+    original_sql: str,
+    schema_hint: str = "",
+    prompt_mode: str = None,
+) -> str:
     if not OPENAI_API_KEY:
         raise RuntimeError("Defina OPENAI_API_KEY no ambiente.")
+
     client = OpenAI(api_key=OPENAI_API_KEY)
 
-    parts = [
-        PROMPT_INSTRUCTION,
-        "",
-        PROMPT_EXAMPLE,
-        ""
-    ]
-    if schema_hint:
-        parts.append("Schema:")
-        parts.append(schema_hint)
-        parts.append("")  # linha em branco
+    if prompt_mode is None:
+        prompt_mode = PROMPT_MODE
 
-    parts.append("Input:")
-    parts.append(original_sql.strip())
+    if prompt_mode == "zero_shot":
+        user_prompt = build_zero_shot_prompt(original_sql, schema_hint)
+    elif prompt_mode in ("cot", "chain_of_thought"):
+        user_prompt = build_chain_of_thought_prompt(original_sql, schema_hint)
+    else:
+        user_prompt = build_few_shot_prompt(original_sql, schema_hint)
 
-    user_content = "\n".join(parts)
+    # System message precisa varia para cot
+    if prompt_mode in ("cot", "chain_of_thought"):
+        system_msg = (
+            "You are a PostgreSQL SQL optimization assistant. "
+            "You will first briefly explain how to optimize the query, "
+            "then output the final optimized SQL query. "
+            "The final SQL query must start with the word SELECT."
+        )
+    else:
+        system_msg = (
+            "You are a PostgreSQL SQL optimization assistant. "
+            "Return ONLY a valid SQL SELECT query, with no explanations, no comments and no markdown."
+        )
 
     resp = client.chat.completions.create(
         model=OPENAI_MODEL,
-        messages=[{"role":"user","content": user_content}],
-        temperature=1
+        messages=[
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_prompt},
+        ],
+        # não passar temperature para evitar erro de unsupported_value
     )
-    sql = resp.choices[0].message.content.strip().strip("```").strip()
+
+    raw = resp.choices[0].message.content
+    sql = extract_sql_from_response(raw)
+
+
     return sql
 
 # ====== LEITURA DE QUERIES ======
@@ -113,18 +190,19 @@ def main():
 
     with open(RESULTS_CSV, "a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
+        
         if first_write:
             w.writerow([
                 "db","query_id",
                 "original_ms","execution_ms_original","planning_ms_original","buffers_plan_original",
                 "rewritten_ms","execution_ms_rewritten","planning_ms_rewritten","buffers_plan_rewritten",
-                "speedup","same_rowcount","same_signature",
+                "speedup","buffers_ratio","same_rowcount","same_signature",
                 "original_sql","rewritten_sql"
             ])
 
         for i, original in enumerate(queries, start=1):
             print(f"\n=== Query {i} ===")
-            # LLM rewrite
+            
             rewritten = rewrite_sql_via_llm(original)
 
             # Original
@@ -135,7 +213,7 @@ def main():
                 print("Erro original:", e)
                 rows_orig, t_orig, ej_orig, plan_ms_o, exec_ms_o, plan_o = [], float("nan"), {}, None, None, {}
             
-            # Rewritten
+            # Reescrita
             try:
                 rows_rew, t_rew = run_timed(rewritten)
                 ej_rew, plan_ms_r, exec_ms_r, plan_r = explain_json(rewritten)
@@ -149,23 +227,39 @@ def main():
             sig_r = rows_signature(rows_rew)
             same_sig = (sig_o == sig_r)
 
-            # Buffers (se desejar algo do plano)
             buffers_o = plan_o.get("Shared Hit Blocks", None) if isinstance(plan_o, dict) else None
             buffers_r = plan_r.get("Shared Hit Blocks", None) if isinstance(plan_r, dict) else None
 
-            speedup = (t_orig / t_rew) if (isinstance(t_orig, float) and isinstance(t_rew, float) and t_rew > 0) else ""
+            if (
+                exec_ms_o is not None
+                and exec_ms_r is not None
+                and exec_ms_r > 0
+            ):
+                speedup = exec_ms_o / exec_ms_r
+            else:
+                speedup = ""
+                
+            if (
+                isinstance(buffers_o, (int, float))
+                and isinstance(buffers_r, (int, float))
+                and buffers_r > 0
+            ):
+                buffers_ratio = buffers_o / buffers_r
+            else:
+                buffers_ratio = ""
 
             w.writerow([
                 PG_DB, i,
                 f"{t_orig:.3f}" if isinstance(t_orig, float) else "",
-                f"{exec_ms_o:.3f}" if exec_ms_o else "",
-                f"{plan_ms_o:.3f}" if plan_ms_o else "",
+                f"{exec_ms_o:.3f}" if exec_ms_o is not None else "",
+                f"{plan_ms_o:.3f}" if plan_ms_o is not None else "",
                 buffers_o if buffers_o is not None else "",
                 f"{t_rew:.3f}" if isinstance(t_rew, float) else "",
-                f"{exec_ms_r:.3f}" if exec_ms_r else "",
-                f"{plan_ms_r:.3f}" if plan_ms_r else "",
+                f"{exec_ms_r:.3f}" if exec_ms_r is not None else "",
+                f"{plan_ms_r:.3f}" if plan_ms_r is not None else "",
                 buffers_r if buffers_r is not None else "",
                 f"{speedup:.3f}" if speedup != "" else "",
+                f"{buffers_ratio:.3f}" if buffers_ratio != "" else "",
                 same_count, same_sig,
                 original.replace("\n"," ").strip(),
                 rewritten.replace("\n"," ").strip()
