@@ -3,11 +3,21 @@ import time
 import csv
 import json
 import hashlib
-import re  # ⬅️ novo
-import psycopg2
-from mistralai import Mistral  # API da Mistral
+import re
+import logging
 
-# ====== CONFIGURAÇÕES ======
+import psycopg2
+from mistralai import Mistral
+from codecarbon import EmissionsTracker
+
+# ===== DEBUG FLAGS =====
+DEBUG_LLM = False       # mostra prompt, RAW da Mistral e SQL limpa
+DEBUG_ENERGY = True    # mostra [ENERGY] no terminal
+
+# Silenciar warnings do CodeCarbon
+logging.getLogger("codecarbon").setLevel(logging.ERROR)
+
+# ===== CONFIG =====
 PG_URL = (
     "postgresql://neondb_owner:npg_xAOBhf4MkK5C@ep-plain-sunset-aervpg8i-pooler.c-2."
     "us-east-2.aws.neon.tech/webshopdb?sslmode=require&channel_binding=require"
@@ -26,16 +36,14 @@ webshop.sizes(id, gender, category, size, size_us, size_uk, size_eu)
 webshop.stock(id, articleid, count, created, updated)
 """.strip()
 
-# ou "zero-shot" ou "few-shot" ou "chain-of-thought"
+# Escolha: "zero-shot", "few-shot", "chain-of-thought"
 PROMPT_TECHNIQUE = "chain-of-thought"
 
-# ====== CAMINHOS ======
+# ===== PATHS =====
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Entrada
 QUERIES_FILE = os.path.join(BASE_DIR, "dbgpt_exp", "queries.txt")
 
-# Saída
 OUTPUT_DIR = os.path.join(BASE_DIR, "dbgpt_exp")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -44,18 +52,15 @@ RESULTS_CSV = os.path.join(
     f"results_mistral_{PROMPT_TECHNIQUE}.csv"
 )
 
-# ====== CONFIG MISTRAL LLM ======
-MISTRAL_MODEL = "mistral-small-latest"  # modelo Mixtral 8x7B na Mistral
+# ===== MISTRAL =====
+MISTRAL_MODEL = "mistral-small-latest"
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 
 if not MISTRAL_API_KEY:
-    raise RuntimeError(
-        "Defina a variável de ambiente MISTRAL_API_KEY com a sua chave da Mistral."
-    )
+    raise RuntimeError("Defina MISTRAL_API_KEY com sua chave.")
 
 mistral_client = Mistral(api_key=MISTRAL_API_KEY)
 
-# Prompt base no estilo do artigo (Instruction / Example / Input)
 PROMPT_INSTRUCTION = (
     "Rewrite the input SQL query to produce an equivalent query that can be executed "
     "on a PostgreSQL database with decreased latency. "
@@ -73,7 +78,7 @@ select ... from t1 inner join (
 on (t1.a = avg and t1.b = t3.b);
 """
 
-# ====== CONEXÃO PG ======
+# ===== DB FUNCS =====
 
 
 def pg_conn():
@@ -89,11 +94,6 @@ def fetch_all(sql: str):
 
 
 def run_timed(sql: str):
-    # LOG: toda SQL enviada pro Neon (para fetch_all)
-    print("\n[NEON][RUN_TIMED] Executando SQL no Neon:")
-    print(sql)
-    print("[NEON][RUN_TIMED] Fim da SQL\n")
-
     t0 = time.time()
     rows = fetch_all(sql)
     dt = (time.time() - t0) * 1000.0  # ms
@@ -101,15 +101,9 @@ def run_timed(sql: str):
 
 
 def explain_json(sql: str):
-    # LOG: toda SQL enviada pro Neon (para EXPLAIN)
-    print("\n[NEON][EXPLAIN] Executando EXPLAIN no Neon para a SQL:")
-    print(sql)
-    print("[NEON][EXPLAIN] Fim da SQL\n")
-
     with pg_conn() as conn, conn.cursor() as cur:
         cur.execute("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + sql)
-        data = cur.fetchall()[0][0][0]  # JSON root obj (list with one element)
-        # Times em ms, se disponíveis
+        data = cur.fetchall()[0][0][0]
         planning = data.get("Planning Time", None)
         execution = data.get("Execution Time", None)
         plan = data.get("Plan", {})
@@ -117,105 +111,83 @@ def explain_json(sql: str):
 
 
 def rows_signature(rows):
-    # assinatura simples para checar equivalência de resultado
-    # (ordem pode variar; se necessário, ajuste sua query para ORDER BY)
     h = hashlib.md5()
     for r in rows:
         h.update(json.dumps(r, default=str).encode("utf-8"))
     return h.hexdigest()
 
+# ===== PROMPTS =====
+
 
 def build_zero_shot_prompt(original_sql, schema_hint=""):
-    prompt = (
+    return (
         f"{PROMPT_INSTRUCTION}\n"
         f"{'Schema: ' + schema_hint if schema_hint else ''}\n"
-        f"Input SQL:\n{original_sql}\n"
-        f"Output SQL:"
+        f"Input SQL:\n{original_sql}\nOutput SQL:"
     )
-    return prompt
 
 
 def build_few_shot_prompt(original_sql, schema_hint=""):
-    prompt = (
-        f"{PROMPT_INSTRUCTION}\n"
-        f"{PROMPT_EXAMPLE}\n"
+    return (
+        f"{PROMPT_INSTRUCTION}\n{PROMPT_EXAMPLE}\n"
         f"{'Schema: ' + schema_hint if schema_hint else ''}\n"
-        f"Input SQL:\n{original_sql}\n"
-        f"Output SQL:"
+        f"Input SQL:\n{original_sql}\nOutput SQL:"
     )
-    return prompt
 
 
 def build_chain_of_thought_prompt(original_sql, schema_hint=""):
-    prompt = (
+    return (
         f"{PROMPT_INSTRUCTION}\n"
         f"{'Schema: ' + schema_hint if schema_hint else ''}\n"
         f"Input SQL:\n{original_sql}\n"
-        "First, explain step by step how you would optimize this query for lower latency in PostgreSQL. "
-        "Then, provide ONLY the final optimized SQL query."
+        "First, explain step-by-step how to optimize; then provide ONLY the final SQL."
     )
-    return prompt
 
-
-# ====== FUNÇÃO PARA LIMPAR/EXTRAIR A SQL DO LLM ======
+# ===== LIMPEZA DO LLM =====
 
 
 def extract_sql(text: str) -> str:
-    """
-    Extrai o SQL de uma resposta 'falante' do LLM.
-    - Primeiro tenta pegar o conteúdo entre ```sql ... ```
-    - Depois tenta pegar qualquer ``` ... ```
-    - Se não achar, pega a partir do primeiro SELECT / WITH / INSERT / UPDATE / DELETE / CREATE / ALTER
-    """
     if not text:
         return ""
 
-    # 1) Tenta bloco ```sql ... ```
     m = re.search(r"```sql\s*(.*?)```", text, re.IGNORECASE | re.DOTALL)
     if m:
         return m.group(1).strip()
 
-    # 2) Tenta qualquer bloco ``` ... ```
     m = re.search(r"```(.*?)```", text, re.DOTALL)
     if m:
         return m.group(1).strip()
 
-    # 3) Não tem bloco markdown → pega a partir da primeira palavra-chave SQL
     upper = text.upper()
     for kw in ("WITH", "SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "ALTER"):
         idx = upper.find(kw)
         if idx != -1:
             return text[idx:].strip()
 
-    # 4) Se nada der certo, devolve o texto original “limpo”
     return text.strip()
 
-
-# ====== LLM MISTRAL – AGORA COM LIMPEZA E LOG COMPLETO ======
+# ===== LLM CALL =====
 
 
 def rewrite_sql_via_mistral(original_sql: str, schema_hint: str = "") -> str:
-    # LOG: SQL original que está indo para a LLM
-    print("\n[LLM][INPUT] SQL original que será otimizada:")
-    print(original_sql)
-    print("[LLM][INPUT] Fim da SQL original\n")
 
     if PROMPT_TECHNIQUE == "zero-shot":
         user_content = build_zero_shot_prompt(original_sql, schema_hint)
     elif PROMPT_TECHNIQUE == "few-shot":
         user_content = build_few_shot_prompt(original_sql, schema_hint)
-    elif PROMPT_TECHNIQUE == "chain-of-thought":
-        user_content = build_chain_of_thought_prompt(original_sql, schema_hint)
     else:
-        raise ValueError("Técnica de prompt desconhecida.")
+        user_content = build_chain_of_thought_prompt(original_sql, schema_hint)
 
-    # LOG: prompt completo enviado para a LLM
-    print("=============== PROMPT ENVIADO PARA A LLM ===============")
-    print(user_content)
-    print("============= FIM PROMPT ENVIADO PARA A LLM =============\n")
+    if DEBUG_LLM:
+        print("\n=== ORIGINAL SQL ===")
+        print(original_sql)
+        print("=== FIM ORIGINAL SQL ===\n")
 
-    retry_count = 0
-    while retry_count < 5:
+        print("=== PROMPT ENVIADO PARA O LLM ===")
+        print(user_content)
+        print("=== FIM PROMPT ENVIADO ===\n")
+
+    for _ in range(5):
         try:
             response = mistral_client.chat.complete(
                 model=MISTRAL_MODEL,
@@ -224,155 +196,176 @@ def rewrite_sql_via_mistral(original_sql: str, schema_hint: str = "") -> str:
                 max_tokens=1024,
             )
 
-            raw = (response.choices[0].message.content or "")
+            raw = response.choices[0].message.content or ""
 
-            # 🔍 Mostra a resposta BRUTA no terminal
-            print("\n================= RAW MISTRAL OUTPUT =================")
-            print(raw)
-            print("=============== FIM RAW MISTRAL OUTPUT ===============\n")
+            if DEBUG_LLM:
+                print("=== RAW LLM RESPONSE ===")
+                print(raw)
+                print("=== FIM RAW LLM RESPONSE ===\n")
 
-            # 🧹 Extrai apenas a SQL da resposta
             cleaned = extract_sql(raw)
 
-            print("===== SQL EXTRAÍDA DO MISTRAL (LIMPA) =====")
-            print(cleaned)
-            print("=========== FIM SQL EXTRAÍDA (LIMPA) ======\n")
+            if DEBUG_LLM:
+                print("=== CLEANED REWRITTEN SQL ===")
+                print(cleaned)
+                print("=== FIM CLEANED REWRITTEN SQL ===\n")
 
-            # fallback: se por algum motivo vier vazio, usa o raw mesmo
-            final_sql = cleaned if cleaned else raw.strip()
-
-            # LOG: SQL final que será enviada para o Neon
-            print("[LLM][OUTPUT→NEON] SQL reescrita que será executada no Neon:")
-            print(final_sql)
-            print("[LLM][OUTPUT→NEON] Fim da SQL reescrita\n")
-
-            return final_sql
+            return cleaned if cleaned else raw.strip()
 
         except Exception as e:
-            print(f"Erro ao chamar Mistral: {e}. Tentando novamente...")
-            retry_count += 1
+            print("Erro chamar LLM:", e)
             time.sleep(5)
 
-    # se tudo falhar, devolve vazio (caller trata)
     return ""
 
-
-# ====== LEITURA DE QUERIES ======
+# ===== READ QUERIES =====
 
 
 def read_queries(path: str):
-    # separa pelas linhas em branco
     with open(path, "r", encoding="utf-8") as f:
         blob = f.read()
-    blocks = [b.strip() for b in blob.split("\n\n") if b.strip()
-              and not b.strip().startswith("--")]
-    return blocks
+    return [
+        b.strip()
+        for b in blob.split("\n\n")
+        if b.strip() and not b.strip().startswith("--")
+    ]
+
+# ===== ENERGY WRAPPER =====
 
 
-# ====== MAIN ======
+def run_query_with_energy(sql: str, tag: str):
+    tracker = EmissionsTracker(
+        project_name=f"mistral_{PROMPT_TECHNIQUE}_{tag}",
+        output_dir=OUTPUT_DIR,
+        output_file=f"emissions_mistral_{PROMPT_TECHNIQUE}.csv",
+        log_level="error",
+        measure_power_secs=1,
+        save_to_file=True,
+    )
+
+    tracker.start()
+    try:
+        rows, ms = run_timed(sql)
+        emissions = tracker.stop()
+        if DEBUG_ENERGY:
+            print(f"[ENERGY] {tag}: {emissions:.8f} kg CO2e")
+    except Exception:
+        tracker.stop()
+        raise
+
+    return rows, ms, emissions
+
+# ===== HELPERS =====
+
+
+def fmt_float(v):
+    if isinstance(v, float) and not (v != v):
+        return f"{v:.3f}"
+    return "NaN"
+
+# ===== MAIN =====
 
 
 def main():
+
     print("Lendo queries de:", QUERIES_FILE)
     queries = read_queries(QUERIES_FILE)
-
-    # garante que a pasta do CSV exista
-    csv_dir = os.path.dirname(RESULTS_CSV)
-    if csv_dir:
-        os.makedirs(csv_dir, exist_ok=True)
 
     print("CSV será gravado em:", RESULTS_CSV)
     first_write = not os.path.exists(RESULTS_CSV)
 
     with open(RESULTS_CSV, "a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
+
         if first_write:
             w.writerow([
-                "db",
-                "llm",
-                "prompt_technique",
-                "query_id",
+                "db", "llm", "prompt_technique", "query_id",
                 "original_ms", "execution_ms_original", "planning_ms_original", "buffers_plan_original",
                 "rewritten_ms", "execution_ms_rewritten", "planning_ms_rewritten", "buffers_plan_rewritten",
+                "emissions_original", "emissions_rewritten",
                 "speedup", "same_rowcount", "same_signature",
                 "original_sql", "rewritten_sql"
             ])
 
         for i, original in enumerate(queries, start=1):
-            print(f"\n===================================================")
-            print(f"=== Query {i} ({PROMPT_TECHNIQUE}, {MISTRAL_MODEL}) ===")
-            print("===================================================\n")
+            print(f"\n=== Query {i} ({PROMPT_TECHNIQUE}, {MISTRAL_MODEL}) ===")
 
-            # LOG: SQL original lida do arquivo
-            print("[PIPELINE] SQL original lida do arquivo (antes da LLM):")
-            print(original)
-            print("[PIPELINE] Fim SQL original lida do arquivo\n")
-
-            # LLM rewrite usando Mistral (AGORA COM LIMPEZA + LOG)
             rewritten = rewrite_sql_via_mistral(original)
 
-            # Original
+            # ORIGINAL
             try:
-                print(
-                    "[PIPELINE][ORIGINAL→NEON] Executando versão ORIGINAL no Neon...\n")
-                rows_orig, t_orig = run_timed(original)
+                rows_orig, t_orig, em_orig = run_query_with_energy(
+                    original, "original")
                 ej_orig, plan_ms_o, exec_ms_o, plan_o = explain_json(original)
             except Exception as e:
                 print("Erro original:", e)
-                rows_orig, t_orig, ej_orig, plan_ms_o, exec_ms_o, plan_o = [], float("nan"), {
-                }, None, None, {}
+                rows_orig, t_orig = [], float("nan")
+                plan_ms_o = exec_ms_o = None
+                plan_o = {}
+                em_orig = float("nan")
 
-            # Rewritten
+            # REWRITTEN
             try:
-                print(
-                    "[PIPELINE][REWRITTEN→NEON] Executando versão REESCRITA no Neon...\n")
-                rows_rew, t_rew = run_timed(rewritten)
+                rows_rew, t_rew, em_rew = run_query_with_energy(
+                    rewritten, "rewritten")
                 ej_rew, plan_ms_r, exec_ms_r, plan_r = explain_json(rewritten)
             except Exception as e:
                 print("Erro reescrita:", e)
-                rows_rew, t_rew, ej_rew, plan_ms_r, exec_ms_r, plan_r = [], float("nan"), {
-                }, None, None, {}
+                rows_rew, t_rew = [], float("nan")
+                plan_ms_r = exec_ms_r = None
+                plan_r = {}
+                em_rew = float("nan")
 
-            # Comparação simples de correção
+            # VALIDATION
             same_count = (len(rows_orig) == len(rows_rew))
+
             sig_o = rows_signature(rows_orig)
             sig_r = rows_signature(rows_rew)
             same_sig = (sig_o == sig_r)
 
-            # Buffers (se desejar algo do plano)
-            buffers_o = plan_o.get("Shared Hit Blocks", None) if isinstance(
+            buffers_o = plan_o.get("Shared Hit Blocks") if isinstance(
                 plan_o, dict) else None
-            buffers_r = plan_r.get("Shared Hit Blocks", None) if isinstance(
+            buffers_r = plan_r.get("Shared Hit Blocks") if isinstance(
                 plan_r, dict) else None
 
-            speedup = (t_orig / t_rew) if (
-                isinstance(t_orig, float)
+            speedup = (
+                t_orig / t_rew
+                if isinstance(t_orig, float)
                 and isinstance(t_rew, float)
                 and t_rew > 0
-            ) else ""
+                else float("nan")
+            )
 
+            # WRITE CSV
             w.writerow([
                 "webshopdb",
                 MISTRAL_MODEL,
                 PROMPT_TECHNIQUE,
                 i,
-                f"{t_orig:.3f}" if isinstance(t_orig, float) else "",
-                f"{exec_ms_o:.3f}" if exec_ms_o else "",
-                f"{plan_ms_o:.3f}" if plan_ms_o else "",
+                fmt_float(t_orig),
+                fmt_float(exec_ms_o),
+                fmt_float(plan_ms_o),
                 buffers_o if buffers_o is not None else "",
-                f"{t_rew:.3f}" if isinstance(t_rew, float) else "",
-                f"{exec_ms_r:.3f}" if exec_ms_r else "",
-                f"{plan_ms_r:.3f}" if plan_ms_r else "",
+                fmt_float(t_rew),
+                fmt_float(exec_ms_r),
+                fmt_float(plan_ms_r),
                 buffers_r if buffers_r is not None else "",
-                f"{speedup:.3f}" if speedup != "" else "",
+                em_orig, em_rew,
+                fmt_float(speedup),
                 same_count, same_sig,
                 original.replace("\n", " ").strip(),
-                (rewritten or "").replace("\n", " ").strip()
+                (rewritten or "").replace("\n", " ").strip(),
             ])
 
+            print(
+                f"[Q{i}] orig={fmt_float(t_orig)} ms, em_orig={fmt_float(em_orig)} | "
+                f"rew={fmt_float(t_rew)} ms, em_rew={fmt_float(em_rew)} | "
+                f"speedup={fmt_float(speedup)} | same_sig={same_sig}"
+            )
+
             print("OK → linha gravada em", RESULTS_CSV)
-            print("===================================================\n")
 
 
+# ===== RUN =====
 if __name__ == "__main__":
     main()

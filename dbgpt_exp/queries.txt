@@ -136,3 +136,75 @@ HAVING MAX(o.ordertimestamp) < current_date - interval '6 months'
     OR MAX(o.ordertimestamp) IS NULL
 ORDER BY last_order_timestamp NULLS FIRST
 LIMIT 200
+
+SELECT
+    c.id,
+    c.firstname,
+    c.lastname,
+    COUNT(o.id) AS num_orders,
+    SUM(o.total::numeric) AS total_spent,
+    AVG(o.total::numeric) AS avg_order_value
+FROM customer c
+JOIN "order" o ON o.customer = c.id
+GROUP BY c.id, c.firstname, c.lastname
+HAVING COUNT(o.id) >= 3
+ORDER BY avg_order_value DESC
+LIMIT 20;
+
+SELECT
+    p.id AS product_id,
+    p.name AS product_name,
+    COALESCE(SUM(s.count), 0) AS total_stock,
+    COALESCE(SUM(op.amount), 0) AS total_sold
+FROM products p
+JOIN articles a ON a.productid = p.id
+LEFT JOIN stock s ON s.articleid = a.id
+LEFT JOIN order_positions op ON op.articleid = a.id
+GROUP BY p.id, p.name
+HAVING COALESCE(SUM(s.count), 0) < 10   -- “baixo” estoque
+ORDER BY total_stock ASC, total_sold DESC;
+
+SELECT
+    date_trunc('month', o.ordertimestamp) AS month,
+    p.category,
+    SUM(op.amount * op.price::numeric) AS revenue
+FROM "order" o
+JOIN order_positions op ON op.orderid = o.id
+JOIN articles a ON a.id = op.articleid
+JOIN products p ON p.id = a.productid
+GROUP BY month, p.category
+ORDER BY month, revenue DESC;
+
+SELECT
+    c.id,
+    c.firstname,
+    c.lastname,
+    COUNT(DISTINCT p.category) AS categories_bought
+FROM customer c
+JOIN "order" o ON o.customer = c.id
+JOIN order_positions op ON op.orderid = o.id
+JOIN articles a ON a.id = op.articleid
+JOIN products p ON p.id = a.productid
+GROUP BY c.id, c.firstname, c.lastname
+HAVING COUNT(DISTINCT p.category) >= 3
+ORDER BY categories_bought DESC, c.id;
+
+WITH bounds AS (
+    SELECT (SELECT MAX(ordertimestamp) FROM "order") AS max_ts
+)
+SELECT
+    a.id AS article_id,
+    a.description,
+    p.name AS product_name,
+    COALESCE(SUM(s.count), 0) AS current_stock,
+    COUNT(DISTINCT o.id) AS num_orders_recent
+FROM articles a
+JOIN products p ON p.id = a.productid
+LEFT JOIN stock s ON s.articleid = a.id
+JOIN order_positions op ON op.articleid = a.id
+JOIN "order" o ON o.id = op.orderid
+CROSS JOIN bounds b
+WHERE o.ordertimestamp >= b.max_ts - interval '1 year'
+GROUP BY a.id, a.description, p.name
+HAVING COALESCE(SUM(s.count), 0) = 0
+ORDER BY num_orders_recent DESC;
