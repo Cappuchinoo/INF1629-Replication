@@ -12,7 +12,7 @@ from codecarbon import EmissionsTracker
 
 # ===== DEBUG FLAGS =====
 DEBUG_LLM = False       # mostra prompt, RAW da Mistral e SQL limpa
-DEBUG_ENERGY = True    # mostra [ENERGY] no terminal
+DEBUG_ENERGY = True     # controla se mostramos resumo com energia no [Qn]
 
 # Silenciar warnings do CodeCarbon
 logging.getLogger("codecarbon").setLevel(logging.ERROR)
@@ -37,7 +37,7 @@ webshop.stock(id, articleid, count, created, updated)
 """.strip()
 
 # Escolha: "zero-shot", "few-shot", "chain-of-thought"
-PROMPT_TECHNIQUE = "chain-of-thought"
+PROMPT_TECHNIQUE = "few-shot"
 
 # ===== PATHS =====
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -50,6 +50,11 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 RESULTS_CSV = os.path.join(
     OUTPUT_DIR,
     f"results_mistral_{PROMPT_TECHNIQUE}.csv"
+)
+
+EMISSIONS_CSV = os.path.join(
+    OUTPUT_DIR,
+    f"emissions_mistral_{PROMPT_TECHNIQUE}.csv"
 )
 
 # ===== MISTRAL =====
@@ -234,21 +239,24 @@ def read_queries(path: str):
 
 
 def run_query_with_energy(sql: str, tag: str):
+    """
+    Executa a query medindo tempo e emissões.
+    Aqui NÃO deixamos o CodeCarbon gravar CSV próprio (save_to_file=False).
+    Vamos usar só o valor de emissões retornado e criar nosso próprio CSV
+    emissions_mistral_<prompt>.csv com 1 linha por query.
+    """
     tracker = EmissionsTracker(
         project_name=f"mistral_{PROMPT_TECHNIQUE}_{tag}",
         output_dir=OUTPUT_DIR,
-        output_file=f"emissions_mistral_{PROMPT_TECHNIQUE}.csv",
+        save_to_file=False,   # <<--- importante: não deixar o CodeCarbon escrever CSV próprio
         log_level="error",
         measure_power_secs=1,
-        save_to_file=True,
     )
 
     tracker.start()
     try:
         rows, ms = run_timed(sql)
         emissions = tracker.stop()
-        if DEBUG_ENERGY:
-            print(f"[ENERGY] {tag}: {emissions:.8f} kg CO2e")
     except Exception:
         tracker.stop()
         raise
@@ -263,6 +271,12 @@ def fmt_float(v):
         return f"{v:.3f}"
     return "NaN"
 
+
+def fmt_pct(v):
+    if isinstance(v, float) and not (v != v):
+        return f"{v:.2f}"
+    return "NaN"
+
 # ===== MAIN =====
 
 
@@ -271,20 +285,36 @@ def main():
     print("Lendo queries de:", QUERIES_FILE)
     queries = read_queries(QUERIES_FILE)
 
-    print("CSV será gravado em:", RESULTS_CSV)
-    first_write = not os.path.exists(RESULTS_CSV)
+    print("CSV de resultados será gravado em:", RESULTS_CSV)
+    first_write_results = not os.path.exists(RESULTS_CSV)
 
-    with open(RESULTS_CSV, "a", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
+    print("CSV de emissões será gravado em:", EMISSIONS_CSV)
+    first_write_emissions = not os.path.exists(EMISSIONS_CSV)
 
-        if first_write:
-            w.writerow([
+    with open(RESULTS_CSV, "a", newline="", encoding="utf-8") as f_res, \
+            open(EMISSIONS_CSV, "a", newline="", encoding="utf-8") as f_em:
+
+        w_res = csv.writer(f_res)
+        w_em = csv.writer(f_em)
+
+        # Cabeçalho do CSV principal de resultados
+        if first_write_results:
+            w_res.writerow([
                 "db", "llm", "prompt_technique", "query_id",
                 "original_ms", "execution_ms_original", "planning_ms_original", "buffers_plan_original",
                 "rewritten_ms", "execution_ms_rewritten", "planning_ms_rewritten", "buffers_plan_rewritten",
                 "emissions_original", "emissions_rewritten",
                 "speedup", "same_rowcount", "same_signature",
                 "original_sql", "rewritten_sql"
+            ])
+
+        # Cabeçalho do CSV de emissões — 1 linha por query
+        if first_write_emissions:
+            w_em.writerow([
+                "db", "llm", "prompt_technique", "query_id",
+                "emissions_original", "emissions_rewritten",
+                "energy_ratio",         # emissions_original / emissions_rewritten
+                "energy_saving_pct"     # % economia de carbono
             ])
 
         for i, original in enumerate(queries, start=1):
@@ -295,7 +325,8 @@ def main():
             # ORIGINAL
             try:
                 rows_orig, t_orig, em_orig = run_query_with_energy(
-                    original, "original")
+                    original, "original"
+                )
                 ej_orig, plan_ms_o, exec_ms_o, plan_o = explain_json(original)
             except Exception as e:
                 print("Erro original:", e)
@@ -307,7 +338,8 @@ def main():
             # REWRITTEN
             try:
                 rows_rew, t_rew, em_rew = run_query_with_energy(
-                    rewritten, "rewritten")
+                    rewritten, "rewritten"
+                )
                 ej_rew, plan_ms_r, exec_ms_r, plan_r = explain_json(rewritten)
             except Exception as e:
                 print("Erro reescrita:", e)
@@ -336,8 +368,20 @@ def main():
                 else float("nan")
             )
 
-            # WRITE CSV
-            w.writerow([
+            # COMPARATIVO DE ENERGIA PARA O CSV emissions_...
+            energy_ratio = float("nan")
+            energy_saving_pct = float("nan")
+            if (
+                isinstance(em_orig, float)
+                and isinstance(em_rew, float)
+                and em_rew > 0.0
+                and em_orig > 0.0
+            ):
+                energy_ratio = em_orig / em_rew          # >1 => rewritten emite menos
+                energy_saving_pct = (em_orig - em_rew) / em_orig * 100.0
+
+            # WRITE CSV PRINCIPAL
+            w_res.writerow([
                 "webshopdb",
                 MISTRAL_MODEL,
                 PROMPT_TECHNIQUE,
@@ -357,13 +401,32 @@ def main():
                 (rewritten or "").replace("\n", " ").strip(),
             ])
 
-            print(
-                f"[Q{i}] orig={fmt_float(t_orig)} ms, em_orig={fmt_float(em_orig)} | "
-                f"rew={fmt_float(t_rew)} ms, em_rew={fmt_float(em_rew)} | "
-                f"speedup={fmt_float(speedup)} | same_sig={same_sig}"
-            )
+            # WRITE CSV DE EMISSÕES (1 linha por query)
+            w_em.writerow([
+                "webshopdb",
+                MISTRAL_MODEL,
+                PROMPT_TECHNIQUE,
+                i,
+                em_orig,
+                em_rew,
+                energy_ratio,
+                energy_saving_pct,
+            ])
 
-            print("OK → linha gravada em", RESULTS_CSV)
+            if DEBUG_ENERGY:
+                print(
+                    f"[Q{i}] "
+                    f"orig={fmt_float(t_orig)} ms, rew={fmt_float(t_rew)} ms, "
+                    f"speedup={fmt_float(speedup)} | "
+                    f"em_orig={em_orig:.8f} kgCO2e, em_rew={em_rew:.8f} kgCO2e, "
+                    f"energy_ratio={fmt_float(energy_ratio)}, "
+                    f"energy_saving_pct={fmt_pct(energy_saving_pct)}%, "
+                    f"same_sig={same_sig}"
+                )
+
+            print("OK → linhas gravadas em:")
+            print("  -", RESULTS_CSV)
+            print("  -", EMISSIONS_CSV)
 
 
 # ===== RUN =====
