@@ -208,3 +208,62 @@ WHERE o.ordertimestamp >= b.max_ts - interval '1 year'
 GROUP BY a.id, a.description, p.name
 HAVING COALESCE(SUM(s.count), 0) = 0
 ORDER BY num_orders_recent DESC;
+
+SELECT
+    p.id,
+    p.name
+FROM products p
+WHERE p.id NOT IN (
+    SELECT DISTINCT a.productid
+    FROM articles a
+    JOIN order_positions op ON op.articleid = a.id
+);
+
+SELECT
+    p.id,
+    p.name,
+    p.category,
+    a.reducedprice,
+    (
+        SELECT AVG(a2.reducedprice::numeric)
+        FROM articles a2
+        JOIN products p2 ON p2.id = a2.productid
+        WHERE p2.category = p.category
+    ) AS avg_category_price
+FROM products p
+JOIN articles a ON a.productid = p.id
+WHERE a.reducedprice::numeric > (
+    SELECT AVG(a3.reducedprice::numeric)
+    FROM articles a3
+    JOIN products p3 ON p3.id = a3.productid
+    WHERE p3.category = p.category
+)
+LIMIT 50;
+
+SELECT 
+    c.id, 
+    c.firstname, 
+    c.lastname
+FROM customer c
+ORDER BY (
+    SELECT SUM(o.total::numeric) 
+    FROM "order" o 
+    WHERE o.customer = c.id
+) DESC 
+LIMIT 50;
+
+SELECT 
+    c.id,
+    c.firstname,
+    (SELECT COUNT(*) FROM "order" o WHERE o.customer = c.id) AS total_orders
+FROM customer c
+WHERE c.id < 1000;
+
+SELECT 
+    o.id,
+    o.ordertimestamp,
+    o.total
+FROM "order" o
+WHERE EXTRACT(MONTH FROM o.ordertimestamp) = 12
+  AND o.total::numeric > 50;
+
