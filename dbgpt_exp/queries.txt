@@ -267,3 +267,70 @@ FROM "order" o
 WHERE EXTRACT(MONTH FROM o.ordertimestamp) = 12
   AND o.total::numeric > 50;
 
+SELECT
+    p.id AS product_id,
+    p.name AS product_name,
+    COALESCE(SUM(s.count), 0) AS total_stock
+FROM products p
+LEFT JOIN articles a ON a.productid = p.id
+LEFT JOIN stock s ON s.articleid = a.id
+GROUP BY p.id, p.name
+ORDER BY total_stock DESC;
+
+SELECT
+    c.id,
+    c.firstname,
+    c.lastname,
+    c.email,
+    c.created
+FROM customer c
+WHERE c.created >= CURRENT_DATE - INTERVAL '30 days'
+ORDER BY c.created DESC;
+
+SELECT
+    p.id AS product_id,
+    p.name AS product_name,
+    SUM(op.amount) AS total_sold
+FROM products p
+JOIN articles a ON a.productid = p.id
+JOIN order_positions op ON op.articleid = a.id
+GROUP BY p.id, p.name
+ORDER BY total_sold DESC
+LIMIT 20;
+
+SELECT
+    c.id,
+    c.firstname,
+    c.lastname,
+    COUNT(DISTINCT p.category) AS categories_bought
+FROM customer c
+JOIN "order" o ON o.customer = c.id
+JOIN order_positions op ON op.orderid = o.id
+JOIN articles a ON a.id = op.articleid
+JOIN products p ON p.id = a.productid
+WHERE o.ordertimestamp >= CURRENT_DATE - INTERVAL '6 months'
+GROUP BY c.id, c.firstname, c.lastname
+HAVING COUNT(DISTINCT p.category) >= 4
+ORDER BY categories_bought DESC;
+
+WITH stats AS (
+    SELECT
+        a.id AS article_id,
+        a.description,
+        SUM(op.amount) AS total_sold,
+        COALESCE(SUM(s.count), 0) AS current_stock
+    FROM articles a
+    LEFT JOIN stock s ON s.articleid = a.id
+    JOIN order_positions op ON op.articleid = a.id
+    GROUP BY a.id, a.description
+)
+SELECT
+    article_id,
+    description,
+    total_sold,
+    current_stock,
+    (total_sold * 1.0 / NULLIF(current_stock, 0)) AS demand_index
+FROM stats
+ORDER BY demand_index DESC NULLS LAST
+LIMIT 10;
+
