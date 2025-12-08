@@ -1,0 +1,5 @@
+db,llm,prompt_technique,query_id,emissions_original,emissions_rewritten,energy_ratio,energy_saving_pct
+webshopdb,llama3.1:8b,chain-of-thought,1,1.0725548761542304e-06,nan,nan,nan
+webshopdb,llama3.1:8b,chain-of-thought,2,9.580836467502662e-07,nan,nan,nan
+webshopdb,llama3.1:8b,chain-of-thought,3,8.35016158471741e-07,nan,nan,nan
+webshopdb,llama3.1:8b,chain-of-thought,4,1.0426682115351205e-06,nan,nan,nan
