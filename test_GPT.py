@@ -1,21 +1,27 @@
 import os, time, csv, json, hashlib
 from openai import OpenAI
 import psycopg2
+from codecarbon import EmissionsTracker
 
-PROMPT_MODE = "cot"
+PROMPT_MODE = "few_shot"
 
 # ====== CONFIGURAÇÕES ======
-PG_HOST = "localhost"
-PG_PORT = 6543            # confirme com `docker ps`
-PG_DB   = "sampledb"
-PG_USER = "postgres"
-PG_PASS = "postgres"
+PG_CONN_STR = "postgresql://neondb_owner:npg_xAOBhf4MkK5C@ep-plain-sunset-aervpg8i-pooler.c-2.us-east-2.aws.neon.tech/webshopdb?sslmode=require&channel_binding=require"
+
+# --- Para quando rodar com DB local
+# PG_HOST = "localhost"
+# PG_PORT = 6543        
+# PG_DB   = "sampledb"
+# PG_USER = "postgres"
+# PG_PASS = "postgres"
+
 
 OPENAI_MODEL = "gpt-4o"    # ou "gpt-4.1" / "gpt-4o" etc.
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 QUERIES_FILE = "dbgpt_exp/queries.txt"
-RESULTS_CSV  = "dbgpt_exp/results.csv"
+RESULTS_CSV  = f"dbgpt_exp/results_GPT_{PROMPT_MODE}.csv"
+EMISSIONS_CSV = f"dbgpt_exp/emissions_GPT_{PROMPT_MODE}.csv"
 
 # Prompt base no estilo do artigo (Instruction / Example / Input)
 PROMPT_INSTRUCTION = (
@@ -23,14 +29,24 @@ PROMPT_INSTRUCTION = (
     "on a PostgreSQL database with decreased latency. Return ONLY the SQL."
 )
 
-PROMPT_EXAMPLE = """Example Input:
-select ... from t1 where t1.a=(select avg(a) from t3 where t1.b=t3.b);
+PROMPT_EXAMPLE = """
+Example Input:
+SELECT c.id, c.firstname, c.lastname
+FROM customer c
+WHERE c.id IN (
+    SELECT o.customer
+    FROM "order" o
+    WHERE o.total > 100
+);
 
 Example Output:
-select ... from t1 inner join (
-    select avg(a) avg, t3.b from t3 group by t3.b
-) as t3
-on (t1.a = avg and t1.b = t3.b);
+SELECT c.id, c.firstname, c.lastname
+FROM customer c
+JOIN (
+    SELECT DISTINCT o.customer AS customer_id
+    FROM "order" o
+    WHERE o.total > 100
+) sub ON sub.customer_id = c.id;
 """
 
 # ====== CONSTRUÇÃO DE PROMPTS (Zero-shot / Few-shot / Prompt-Chaining) ======
@@ -71,9 +87,11 @@ def build_chain_of_thought_prompt(original_sql: str, schema_hint: str = "") -> s
 
 # ====== CONEXÃO PG ======
 def pg_conn():
-    return psycopg2.connect(
-        host=PG_HOST, port=PG_PORT, dbname=PG_DB, user=PG_USER, password=PG_PASS
-    )
+    return psycopg2.connect(PG_CONN_STR)
+    
+    # return psycopg2.connect(
+    #     host=PG_HOST, port=PG_PORT, dbname=PG_DB, user=PG_USER, password=PG_PASS
+    # )
 
 def fetch_all(sql: str):
     with pg_conn() as conn, conn.cursor() as cur:
@@ -104,6 +122,28 @@ def rows_signature(rows):
     return h.hexdigest()
 
 def extract_sql_from_response(raw: str) -> str:
+    """
+    Extrai SQL sem remover linhas essenciais. Remove apenas markdown.
+    Mantém a estrutura completa do SELECT.
+    """
+    if not raw:
+        return ""
+
+    cleaned = raw.strip()
+
+    # remove blocos markdown
+    cleaned = cleaned.replace("```sql", "")
+    cleaned = cleaned.replace("```SQL", "")
+    cleaned = cleaned.replace("```", "")
+
+    # se a resposta contém SELECT, apanha tudo a partir do primeiro SELECT
+    idx = cleaned.lower().find("select")
+    if idx != -1:
+        return cleaned[idx:].strip()
+
+    return cleaned.strip()
+
+def extract_sql_from_response_cot(raw: str) -> str:
     cleaned = raw.strip()
 
     # Tenta encontrar bloco ```sql ... ```
@@ -122,7 +162,7 @@ def extract_sql_from_response(raw: str) -> str:
         if lines[i].lstrip().upper().startswith("SELECT"):
             return "\n".join(lines[i:]).strip()
 
-    # 3) Fallback: retornar tudo
+    # Retornar tudo em último caso
     return cleaned.strip()
 
 # ====== OPENAI ======
@@ -170,7 +210,10 @@ def rewrite_sql_via_llm(
     )
 
     raw = resp.choices[0].message.content
-    sql = extract_sql_from_response(raw)
+    if prompt_mode in ("cot", "chain_of_thought"):
+        sql = extract_sql_from_response_cot(raw)
+    else:
+        sql = extract_sql_from_response(raw)
 
 
     return sql
@@ -183,22 +226,54 @@ def read_queries(path: str):
     blocks = [b.strip() for b in blob.split("\n\n") if b.strip() and not b.strip().startswith("--")]
     return blocks
 
+
+def run_query_with_energy(sql: str, tag: str):
+    tracker = EmissionsTracker(
+        project_name=f"GPT_{PROMPT_MODE}_{tag}",
+        output_dir=os.path.dirname(EMISSIONS_CSV),
+        save_to_file=False,
+        log_level="error",
+        measure_power_secs=1,
+    )
+    tracker.start()
+    try:
+        rows, ms = run_timed(sql)
+        emissions = tracker.stop()
+    except Exception:
+        tracker.stop()
+        raise
+    return rows, ms, emissions
+
 # ====== MAIN ======
 def main():
     queries = read_queries(QUERIES_FILE)
     first_write = not os.path.exists(RESULTS_CSV)
+    first_write_emissions = not os.path.exists(EMISSIONS_CSV)
 
-    with open(RESULTS_CSV, "a", newline="", encoding="utf-8") as f:
+    with open(RESULTS_CSV, "a", newline="", encoding="utf-8") as f, \
+         open(EMISSIONS_CSV, "a", newline="", encoding="utf-8") as f_em:
+             
         w = csv.writer(f)
+        w_em = csv.writer(f_em)
+        
         
         if first_write:
             w.writerow([
                 "db","query_id",
                 "original_ms","execution_ms_original","planning_ms_original","buffers_plan_original",
                 "rewritten_ms","execution_ms_rewritten","planning_ms_rewritten","buffers_plan_rewritten",
+                "emissions_original", "emissions_rewritten", 
                 "speedup","buffers_ratio","same_rowcount","same_signature",
                 "original_sql","rewritten_sql"
             ])
+        
+        if first_write_emissions:
+            w_em.writerow([
+                "db", "llm", "prompt_technique", "query_id",
+                "emissions_original", "emissions_rewritten",
+                "energy_ratio", "energy_saving_pct"
+            ])
+        
 
         for i, original in enumerate(queries, start=1):
             print(f"\n=== Query {i} ===")
@@ -207,19 +282,21 @@ def main():
 
             # Original
             try:
-                rows_orig, t_orig = run_timed(original)
+                rows_orig, t_orig, em_orig = run_query_with_energy(original, "original")
                 ej_orig, plan_ms_o, exec_ms_o, plan_o = explain_json(original)
             except Exception as e:
                 print("Erro original:", e)
                 rows_orig, t_orig, ej_orig, plan_ms_o, exec_ms_o, plan_o = [], float("nan"), {}, None, None, {}
+                em_orig = float("nan")
             
             # Reescrita
             try:
-                rows_rew, t_rew = run_timed(rewritten)
+                rows_rew, t_rew, em_rew = run_query_with_energy(rewritten, "rewritten")
                 ej_rew, plan_ms_r, exec_ms_r, plan_r = explain_json(rewritten)
             except Exception as e:
                 print("Erro reescrita:", e)
                 rows_rew, t_rew, ej_rew, plan_ms_r, exec_ms_r, plan_r = [], float("nan"), {}, None, None, {}
+                em_rew = float("nan")
 
             # Comparação simples de correção
             same_count = (len(rows_orig) == len(rows_rew))
@@ -247,9 +324,21 @@ def main():
                 buffers_ratio = buffers_o / buffers_r
             else:
                 buffers_ratio = ""
+                
+            energy_ratio = float("nan")
+            energy_saving_pct = float("nan")
+            if (
+                isinstance(em_orig, float)
+                and isinstance(em_rew, float)
+                and em_rew > 0.0
+                and em_orig > 0.0
+            ):
+                energy_ratio = em_orig / em_rew
+                energy_saving_pct = (em_orig - em_rew) / em_orig * 100.0
+            
 
             w.writerow([
-                PG_DB, i,
+                "webshopdb", i,
                 f"{t_orig:.3f}" if isinstance(t_orig, float) else "",
                 f"{exec_ms_o:.3f}" if exec_ms_o is not None else "",
                 f"{plan_ms_o:.3f}" if plan_ms_o is not None else "",
@@ -260,9 +349,21 @@ def main():
                 buffers_r if buffers_r is not None else "",
                 f"{speedup:.3f}" if speedup != "" else "",
                 f"{buffers_ratio:.3f}" if buffers_ratio != "" else "",
+                em_orig, em_rew,
                 same_count, same_sig,
                 original.replace("\n"," ").strip(),
                 rewritten.replace("\n"," ").strip()
+            ])
+            
+            w_em.writerow([
+                "webshopdb",
+                OPENAI_MODEL,
+                PROMPT_MODE,
+                i,
+                em_orig,
+                em_rew,
+                energy_ratio,
+                energy_saving_pct,
             ])
 
             print("OK → linha gravada em results.csv")
