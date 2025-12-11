@@ -6,6 +6,9 @@ RESULTS_CSV = "dbgpt_exp/results.csv"
 
 IGNORE_OUTLIERS = True
 
+FIXED_THRESHOLD = True
+MAX_SPEEDUP = 3.0
+MAX_BUFFERS_RATIO = 10.0
 
 def parse_float(x):
     try:
@@ -40,6 +43,11 @@ def iqr_filter(values):
     upper = q3 + 1.5 * iqr
 
     return [v for v in values if lower <= v <= upper]
+
+def domain_filter(values, max_value=None):
+    if max_value is None:
+        return values
+    return [v for v in values if v <= max_value]
 
 
 def safe_mean(xs):
@@ -112,9 +120,19 @@ def main():
     # ------------------------------
     if IGNORE_OUTLIERS:
         print("\n=== MÉTRICAS SEM OUTLIERS (IQR FILTER) ===\n")
+        
+        if FIXED_THRESHOLD:
+            speed_base = speedups
+            buffers_base = buffers
 
-        speedups_no = iqr_filter(speedups)
-        buffers_no = iqr_filter(buffers)
+            speedups_no = domain_filter(speed_base, MAX_SPEEDUP)
+            buffers_no = domain_filter(buffers_base, MAX_BUFFERS_RATIO)
+        else:
+            speedups_no = iqr_filter(speedups)
+            buffers_no = iqr_filter(buffers)
+        
+        
+
 
         print(f"Speedup média   : {safe_mean(speedups_no):.4f}")
         print(f"Speedup mediana : {safe_median(speedups_no):.4f}")
