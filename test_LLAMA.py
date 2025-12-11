@@ -7,7 +7,8 @@ import psycopg2
 import ollama
 from codecarbon import EmissionsTracker
 
-PROMPT_MODE = "zero-shot"  # "zero-shot"  ou "few-shot" ou "chain-of-thought"
+# "zero-shot"  ou "few-shot" ou "chain-of-thought"
+PROMPT_MODE = "chain-of-thought"
 
 # ====== CONFIGURAÇÕES ======
 
@@ -60,6 +61,7 @@ JOIN (
 
 # ====== CONSTRUÇÃO DE PROMPTS (Zero-shot / Few-shot / Prompt-Chaining) ======
 
+
 def build_zero_shot_prompt(original_sql: str, schema_hint: str = "") -> str:
     schema_line = f"Schema: {schema_hint}\n" if schema_hint else ""
     prompt = (
@@ -69,6 +71,7 @@ def build_zero_shot_prompt(original_sql: str, schema_hint: str = "") -> str:
         f"Output SQL:"
     )
     return prompt
+
 
 def build_few_shot_prompt(original_sql: str, schema_hint: str = "") -> str:
     schema_line = f"Schema: {schema_hint}\n" if schema_hint else ""
@@ -94,8 +97,11 @@ def build_chain_of_thought_prompt(original_sql: str, schema_hint: str = "") -> s
     return prompt
 
 # ====== CONEXÃO PG ======
+
+
 def pg_conn():
     return psycopg2.connect(PG_URL)
+
 
 def fetch_all(sql: str):
     with pg_conn() as conn, conn.cursor() as cur:
@@ -104,26 +110,30 @@ def fetch_all(sql: str):
             return cur.fetchall()
         return []
 
+
 def run_timed(sql: str):
     t0 = time.time()
     rows = fetch_all(sql)
     dt = (time.time() - t0) * 1000.0  # ms
     return rows, dt
 
+
 def explain_json(sql: str):
     with pg_conn() as conn, conn.cursor() as cur:
         cur.execute("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + sql)
-        data = cur.fetchall()[0][0][0]  
+        data = cur.fetchall()[0][0][0]
         planning = data.get("Planning Time", None)
         execution = data.get("Execution Time", None)
         plan = data.get("Plan", {})
         return data, planning, execution, plan
+
 
 def rows_signature(rows):
     h = hashlib.md5()
     for r in rows:
         h.update(json.dumps(r, default=str).encode("utf-8"))
     return h.hexdigest()
+
 
 def extract_sql_from_response(raw: str) -> str:
     """
@@ -146,6 +156,7 @@ def extract_sql_from_response(raw: str) -> str:
         return cleaned[idx:].strip()
 
     return cleaned.strip()
+
 
 def extract_sql_from_response_cot(raw: str) -> str:
     cleaned = raw.strip()
@@ -170,6 +181,8 @@ def extract_sql_from_response_cot(raw: str) -> str:
     return cleaned.strip()
 
 # ====== LLAMA ======
+
+
 def rewrite_sql_via_ollama(
     original_sql: str,
     schema_hint: str = "",
@@ -219,11 +232,15 @@ def rewrite_sql_via_ollama(
     return sql
 
 # ====== LEITURA DE QUERIES ======
+
+
 def read_queries(path: str):
     with open(path, "r", encoding="utf-8") as f:
         blob = f.read()
-    blocks = [b.strip() for b in blob.split("\n\n") if b.strip() and not b.strip().startswith("--")]
+    blocks = [b.strip() for b in blob.split("\n\n") if b.strip()
+              and not b.strip().startswith("--")]
     return blocks
+
 
 def run_query_with_energy(sql: str, tag: str):
     tracker = EmissionsTracker(
@@ -242,25 +259,26 @@ def run_query_with_energy(sql: str, tag: str):
         raise
     return rows, ms, emissions
 
+
 def main():
     queries = read_queries(QUERIES_FILE)
     first_write_results = not os.path.exists(RESULTS_CSV)
     first_write_emissions = not os.path.exists(EMISSIONS_CSV)
 
     with open(RESULTS_CSV, "a", newline="", encoding="utf-8") as f, \
-         open(EMISSIONS_CSV, "a", newline="", encoding="utf-8") as f_em:
+            open(EMISSIONS_CSV, "a", newline="", encoding="utf-8") as f_em:
 
         w = csv.writer(f)
         w_em = csv.writer(f_em)
 
         if first_write_results:
             w.writerow([
-                "db","query_id",
-                "original_ms","execution_ms_original","planning_ms_original","buffers_plan_original",
-                "rewritten_ms","execution_ms_rewritten","planning_ms_rewritten","buffers_plan_rewritten",
-                "emissions_original", "emissions_rewritten", 
-                "speedup","buffers_ratio","same_rowcount","same_signature",
-                "original_sql","rewritten_sql"
+                "db", "query_id",
+                "original_ms", "execution_ms_original", "planning_ms_original", "buffers_plan_original",
+                "rewritten_ms", "execution_ms_rewritten", "planning_ms_rewritten", "buffers_plan_rewritten",
+                "emissions_original", "emissions_rewritten",
+                "speedup", "buffers_ratio", "same_rowcount", "same_signature",
+                "original_sql", "rewritten_sql"
             ])
 
         if first_write_emissions:
@@ -275,22 +293,26 @@ def main():
 
             rewritten = rewrite_sql_via_ollama(original)
 
-             # Original
+            # Original
             try:
-                rows_orig, t_orig, em_orig = run_query_with_energy(original, "original")
+                rows_orig, t_orig, em_orig = run_query_with_energy(
+                    original, "original")
                 ej_orig, plan_ms_o, exec_ms_o, plan_o = explain_json(original)
             except Exception as e:
                 print("Erro original:", e)
-                rows_orig, t_orig, ej_orig, plan_ms_o, exec_ms_o, plan_o = [], float("nan"), {}, None, None, {}
+                rows_orig, t_orig, ej_orig, plan_ms_o, exec_ms_o, plan_o = [], float("nan"), {
+                }, None, None, {}
                 em_orig = float("nan")
-            
+
             # Reescrita
             try:
-                rows_rew, t_rew, em_rew = run_query_with_energy(rewritten, "rewritten")
+                rows_rew, t_rew, em_rew = run_query_with_energy(
+                    rewritten, "rewritten")
                 ej_rew, plan_ms_r, exec_ms_r, plan_r = explain_json(rewritten)
             except Exception as e:
                 print("Erro reescrita:", e)
-                rows_rew, t_rew, ej_rew, plan_ms_r, exec_ms_r, plan_r = [], float("nan"), {}, None, None, {}
+                rows_rew, t_rew, ej_rew, plan_ms_r, exec_ms_r, plan_r = [], float("nan"), {
+                }, None, None, {}
                 em_rew = float("nan")
 
             # Comparação simples de correção
@@ -299,8 +321,10 @@ def main():
             sig_r = rows_signature(rows_rew)
             same_sig = (sig_o == sig_r)
 
-            buffers_o = plan_o.get("Shared Hit Blocks", None) if isinstance(plan_o, dict) else None
-            buffers_r = plan_r.get("Shared Hit Blocks", None) if isinstance(plan_r, dict) else None
+            buffers_o = plan_o.get("Shared Hit Blocks", None) if isinstance(
+                plan_o, dict) else None
+            buffers_r = plan_r.get("Shared Hit Blocks", None) if isinstance(
+                plan_r, dict) else None
 
             if (
                 exec_ms_o is not None
@@ -310,7 +334,7 @@ def main():
                 speedup = exec_ms_o / exec_ms_r
             else:
                 speedup = ""
-                
+
             if (
                 isinstance(buffers_o, (int, float))
                 and isinstance(buffers_r, (int, float))
@@ -319,7 +343,7 @@ def main():
                 buffers_ratio = buffers_o / buffers_r
             else:
                 buffers_ratio = ""
-                
+
             energy_ratio = float("nan")
             energy_saving_pct = float("nan")
             if (
@@ -345,8 +369,8 @@ def main():
                 f"{buffers_ratio:.3f}" if buffers_ratio != "" else "",
                 em_orig, em_rew,
                 same_count, same_sig,
-                original.replace("\n"," ").strip(),
-                rewritten.replace("\n"," ").strip()
+                original.replace("\n", " ").strip(),
+                rewritten.replace("\n", " ").strip()
             ])
 
             w_em.writerow([
@@ -361,6 +385,7 @@ def main():
             ])
 
             print("OK → linha gravada em results.csv")
+
 
 if __name__ == "__main__":
     main()
