@@ -37,7 +37,7 @@ webshop.stock(id, articleid, count, created, updated)
 """.strip()
 
 # Escolha: "zero-shot", "few-shot", "chain-of-thought"
-PROMPT_TECHNIQUE = "few-shot"
+PROMPT_TECHNIQUE = "chain-of-thought"
 
 # ===== PATHS =====
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -155,14 +155,17 @@ def extract_sql(text: str) -> str:
     if not text:
         return ""
 
+    # Bloco ```sql ... ```
     m = re.search(r"```sql\s*(.*?)```", text, re.IGNORECASE | re.DOTALL)
     if m:
         return m.group(1).strip()
 
+    # Bloco ``` ... ```
     m = re.search(r"```(.*?)```", text, re.DOTALL)
     if m:
         return m.group(1).strip()
 
+    # Procura primeira keyword SQL relevante
     upper = text.upper()
     for kw in ("WITH", "SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "ALTER"):
         idx = upper.find(kw)
@@ -248,7 +251,7 @@ def run_query_with_energy(sql: str, tag: str):
     tracker = EmissionsTracker(
         project_name=f"mistral_{PROMPT_TECHNIQUE}_{tag}",
         output_dir=OUTPUT_DIR,
-        save_to_file=False,   # <<--- importante: não deixar o CodeCarbon escrever CSV próprio
+        save_to_file=False,   # não deixar o CodeCarbon escrever CSV próprio
         log_level="error",
         measure_power_secs=1,
     )
@@ -297,18 +300,18 @@ def main():
         w_res = csv.writer(f_res)
         w_em = csv.writer(f_em)
 
-        # Cabeçalho do CSV principal de resultados
+        # Cabeçalho do CSV principal de resultados (igual ao GPT)
         if first_write_results:
             w_res.writerow([
-                "db", "llm", "prompt_technique", "query_id",
+                "db", "query_id",
                 "original_ms", "execution_ms_original", "planning_ms_original", "buffers_plan_original",
                 "rewritten_ms", "execution_ms_rewritten", "planning_ms_rewritten", "buffers_plan_rewritten",
                 "emissions_original", "emissions_rewritten",
-                "speedup", "same_rowcount", "same_signature",
+                "speedup", "buffers_ratio", "same_rowcount", "same_signature",
                 "original_sql", "rewritten_sql"
             ])
 
-        # Cabeçalho do CSV de emissões — 1 linha por query
+        # Cabeçalho do CSV de emissões — 1 linha por query (compatível com GPT)
         if first_write_emissions:
             w_em.writerow([
                 "db", "llm", "prompt_technique", "query_id",
@@ -360,13 +363,25 @@ def main():
             buffers_r = plan_r.get("Shared Hit Blocks") if isinstance(
                 plan_r, dict) else None
 
-            speedup = (
-                t_orig / t_rew
-                if isinstance(t_orig, float)
-                and isinstance(t_rew, float)
-                and t_rew > 0
-                else float("nan")
-            )
+            # speedup igual ao GPT: baseado em Execution Time do EXPLAIN
+            if (
+                exec_ms_o is not None
+                and exec_ms_r is not None
+                and exec_ms_r > 0
+            ):
+                speedup = exec_ms_o / exec_ms_r
+            else:
+                speedup = ""
+
+            # buffers_ratio igual ao GPT
+            if (
+                isinstance(buffers_o, (int, float))
+                and isinstance(buffers_r, (int, float))
+                and buffers_r > 0
+            ):
+                buffers_ratio = buffers_o / buffers_r
+            else:
+                buffers_ratio = ""
 
             # COMPARATIVO DE ENERGIA PARA O CSV emissions_...
             energy_ratio = float("nan")
@@ -380,22 +395,20 @@ def main():
                 energy_ratio = em_orig / em_rew          # >1 => rewritten emite menos
                 energy_saving_pct = (em_orig - em_rew) / em_orig * 100.0
 
-            # WRITE CSV PRINCIPAL
+            # WRITE CSV PRINCIPAL (igual ao GPT-script)
             w_res.writerow([
-                "webshopdb",
-                MISTRAL_MODEL,
-                PROMPT_TECHNIQUE,
-                i,
-                fmt_float(t_orig),
-                fmt_float(exec_ms_o),
-                fmt_float(plan_ms_o),
+                "webshopdb", i,
+                f"{t_orig:.3f}" if isinstance(t_orig, float) else "",
+                f"{exec_ms_o:.3f}" if exec_ms_o is not None else "",
+                f"{plan_ms_o:.3f}" if plan_ms_o is not None else "",
                 buffers_o if buffers_o is not None else "",
-                fmt_float(t_rew),
-                fmt_float(exec_ms_r),
-                fmt_float(plan_ms_r),
+                f"{t_rew:.3f}" if isinstance(t_rew, float) else "",
+                f"{exec_ms_r:.3f}" if exec_ms_r is not None else "",
+                f"{plan_ms_r:.3f}" if plan_ms_r is not None else "",
                 buffers_r if buffers_r is not None else "",
+                f"{speedup:.3f}" if speedup != "" else "",
+                f"{buffers_ratio:.3f}" if buffers_ratio != "" else "",
                 em_orig, em_rew,
-                fmt_float(speedup),
                 same_count, same_sig,
                 original.replace("\n", " ").strip(),
                 (rewritten or "").replace("\n", " ").strip(),
@@ -414,10 +427,13 @@ def main():
             ])
 
             if DEBUG_ENERGY:
+                # para log, convertemos speedup para float/NaN só pra ficar bonitinho
+                speedup_for_print = speedup if isinstance(
+                    speedup, float) else float("nan")
                 print(
                     f"[Q{i}] "
                     f"orig={fmt_float(t_orig)} ms, rew={fmt_float(t_rew)} ms, "
-                    f"speedup={fmt_float(speedup)} | "
+                    f"speedup={fmt_float(speedup_for_print)} | "
                     f"em_orig={em_orig:.8f} kgCO2e, em_rew={em_rew:.8f} kgCO2e, "
                     f"energy_ratio={fmt_float(energy_ratio)}, "
                     f"energy_saving_pct={fmt_pct(energy_saving_pct)}%, "

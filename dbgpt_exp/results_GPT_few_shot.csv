@@ -1,0 +1,1 @@
+db,query_id,original_ms,execution_ms_original,planning_ms_original,buffers_plan_original,rewritten_ms,execution_ms_rewritten,planning_ms_rewritten,buffers_plan_rewritten,emissions_original,emissions_rewritten,speedup,buffers_ratio,same_rowcount,same_signature,original_sql,rewritten_sql
